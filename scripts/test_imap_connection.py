@@ -3,7 +3,8 @@
 
 Uses the same environment variables as imap_local_repository.py
 (IMAP_HOST, IMAP_USERNAME, IMAP_PASSWORD_FILE or IMAP_PASSWORD, and optionally
-IMAP_SECURITY, IMAP_PORT, IMAP_CA_FILE). Lists every folder with its message
+IMAP_SECURITY, IMAP_PORT, IMAP_CA_FILE). With IMAP_AUTH=oauth2 it uses the saved
+OAuth sign-in (see --authorise in imap_local_repository.py). Lists every folder with its message
 count and shows the name to use in IMAP_FOLDERS / IMAP_EXCLUDE_FOLDERS.
 No messages are fetched, changed, or deleted.
 """
@@ -14,6 +15,7 @@ import imap_local_repository as imp
 def main() -> int:
     try:
         config = imp.get_configuration()
+        imp.apply_network_preference(config)
         session = imp.ImapSession(config)
         session.call("login", lambda c: ("OK", []))
         folders = session.list_folders()

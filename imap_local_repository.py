@@ -20,6 +20,13 @@ Repository ownership model (same philosophy as the Gmail importer):
 The server is accessed strictly read-only: folders are opened with EXAMINE
 and message bodies are fetched with BODY.PEEK[], so \\Seen is never set.
 
+Two login types:
+  - Regular IMAP: username + password (IMAP_AUTH=password, the default). Works with
+    any IMAP4 server that accepts passwords.
+  - Outlook.com OAuth: IMAP_AUTH=microsoft-oauth2. Microsoft-specific: it uses
+    Microsoft's sign-in endpoints and a device-code sign-in done once by --authorise.
+    It does not work with Gmail, Yahoo or any other provider's OAuth.
+
 Configuration is supplied through environment variables. Run with --help
 for the full list.
 """
@@ -38,12 +45,16 @@ import os
 import random
 import re
 import shutil
+import socket
 import sqlite3
 import ssl
 import stat
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -92,6 +103,14 @@ class ImapAuthError(RuntimeError):
 
 class ImapCommandError(RuntimeError):
     """The server rejected one command (not transient)."""
+
+
+class TokenRefreshError(OSError):
+    """Transient failure obtaining an OAuth access token; retried with backoff."""
+
+
+class _TokenRejected(Exception):
+    """Internal: the server refused a cached access token; refresh and retry."""
 
 
 class _TransientResponse(Exception):
@@ -280,6 +299,308 @@ def parse_fetch_response(data, uid: int) -> Optional[dict]:
 
 
 # --------------------------------------------------------------------------
+# Network preference: IPv4 fallback when IPv6 is unusable
+# --------------------------------------------------------------------------
+
+_ORIGINAL_GETADDRINFO = socket.getaddrinfo
+
+
+def force_ipv4() -> None:
+    """Make every later connection in this process use IPv4 only."""
+    socket.getaddrinfo = lambda *a, **k: [
+        info for info in _ORIGINAL_GETADDRINFO(*a, **k) if info[0] == socket.AF_INET
+    ]
+
+
+def ipv6_unusable(host: str, port: int, timeout: float = 5.0) -> bool:
+    """True when the host has IPv6 and IPv4 addresses, IPv6 fails and IPv4 works.
+
+    Python tries each IPv6 address in turn and waits out the full timeout on each,
+    which makes a network with broken IPv6 look like a hang.
+    """
+    try:
+        infos = _ORIGINAL_GETADDRINFO(host, port, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    v6 = [i for i in infos if i[0] == socket.AF_INET6]
+    v4 = [i for i in infos if i[0] == socket.AF_INET]
+    if not v6 or not v4:
+        return False
+
+    def connects(info) -> bool:
+        try:
+            with socket.create_connection(info[4][:2], timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    return (not connects(v6[0])) and connects(v4[0])
+
+
+def apply_network_preference(config: dict) -> None:
+    mode = config["ipv4_only"]
+    if mode == "false":
+        return
+    if mode == "true":
+        force_ipv4()
+        logging.info("IPv4 only (IMAP_IPV4_ONLY=true).")
+        return
+    targets = [(config["host"], config["port"])]
+    if config["auth"] == "microsoft-oauth2":
+        login = urllib.parse.urlsplit(MS_LOGIN_BASE)
+        targets.append((login.hostname, login.port or (443 if login.scheme == "https" else 80)))
+    for host, port in targets:
+        if ipv6_unusable(host, port):
+            force_ipv4()
+            logging.info("IPv6 to %s does not work but IPv4 does; using IPv4 only.", host)
+            return
+
+
+# --------------------------------------------------------------------------
+# OAuth2 for personal Outlook.com accounts (device-code flow, XOAUTH2)
+# --------------------------------------------------------------------------
+
+# Overridable for testing against a mock token endpoint only.
+MS_LOGIN_BASE = os.environ.get("IMAP_OAUTH_AUTHORITY_BASE", "https://login.microsoftonline.com")
+DEFAULT_OAUTH_SCOPES = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+DEFAULT_OAUTH_HOST = "outlook.office365.com"
+TOKEN_EXPIRY_MARGIN_SECONDS = 300
+TRANSIENT_TOKEN_ERRORS = {"temporarily_unavailable", "server_error", "http_429"}
+
+
+def _post_form(url: str, fields: dict, timeout: float = 30.0) -> tuple[int, dict]:
+    data = urllib.parse.urlencode(fields).encode("ascii")
+    request = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8", "replace")
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        body = exc.read().decode("utf-8", "replace")
+    try:
+        return status, json.loads(body)
+    except json.JSONDecodeError:
+        return status, {"error": f"http_{status}", "error_description": body[:200]}
+
+
+def _describe_token_error(response: dict) -> str:
+    text = f"{response.get('error', 'unknown_error')}: {response.get('error_description', '')}"
+    return " ".join(text.split())[:300]
+
+
+def write_private_file(path: Path, text: str) -> None:
+    """Atomically write a file readable only by the owner."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    temp = path.with_name(path.name + ".tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, path)
+    os.chmod(path, 0o600)
+
+
+class MicrosoftOAuth:
+    """Access tokens for IMAP, from a refresh token saved by --authorise."""
+
+    def __init__(self, client_id: str, tenant: str, scopes: str, token_file: Path):
+        self.client_id = client_id
+        self.tenant = tenant
+        self.scopes = scopes
+        self.token_file = token_file
+        self.refresh_token: Optional[str] = None
+        self._access_token: Optional[str] = None
+        self._expires_at = 0.0
+        self.token_is_fresh = False
+
+    @property
+    def authority(self) -> str:
+        return f"{MS_LOGIN_BASE}/{self.tenant}"
+
+    def save_refresh_token(self, refresh_token: str) -> None:
+        self.refresh_token = refresh_token
+        write_private_file(self.token_file, json.dumps({
+            "client_id": self.client_id,
+            "tenant": self.tenant,
+            "scopes": self.scopes,
+            "refresh_token": refresh_token,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+        }, indent=2) + "\n")
+
+    def _load(self) -> None:
+        try:
+            data = json.loads(self.token_file.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise ImapAuthError(
+                f"No saved sign-in found at {self.token_file}. Run this script with "
+                "--authorise to sign in to the Microsoft account."
+            ) from exc
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ImapAuthError(
+                f"Cannot read the OAuth token file {self.token_file}: {exc}. "
+                "Run with --authorise to create it again."
+            ) from exc
+        if data.get("client_id") != self.client_id or data.get("tenant") != self.tenant:
+            raise ImapAuthError(
+                f"{self.token_file} was created for a different IMAP_OAUTH_CLIENT_ID or "
+                "IMAP_OAUTH_TENANT. Run with --authorise to sign in again."
+            )
+        if not data.get("refresh_token"):
+            raise ImapAuthError(f"{self.token_file} holds no refresh token. Run with --authorise.")
+        self.refresh_token = data["refresh_token"]
+        _warn_if_permissive_permissions(self.token_file, "OAuth token file")
+
+    def invalidate(self) -> None:
+        self._access_token = None
+
+    def access_token(self) -> str:
+        """Return a usable access token, refreshing when missing or about to expire."""
+        if self._access_token and time.time() < self._expires_at - TOKEN_EXPIRY_MARGIN_SECONDS:
+            self.token_is_fresh = False
+            return self._access_token
+        if self.refresh_token is None:
+            self._load()
+        status, response = _post_form(
+            f"{self.authority}/oauth2/v2.0/token",
+            {
+                "grant_type": "refresh_token",
+                "client_id": self.client_id,
+                "refresh_token": self.refresh_token,
+                "scope": self.scopes,
+            },
+        )
+        if "access_token" not in response:
+            error = str(response.get("error", ""))
+            if error in TRANSIENT_TOKEN_ERRORS or error.startswith("http_5"):
+                raise TokenRefreshError(f"token endpoint unavailable: {_describe_token_error(response)}")
+            raise ImapAuthError(
+                f"Microsoft refused to renew the sign-in ({_describe_token_error(response)}). "
+                "Run this script with --authorise to sign in again."
+            )
+        self._access_token = response["access_token"]
+        self._expires_at = time.time() + int(response.get("expires_in", 3600))
+        self.token_is_fresh = True
+        new_refresh = response.get("refresh_token")
+        if new_refresh and new_refresh != self.refresh_token:
+            self.save_refresh_token(new_refresh)
+        return self._access_token
+
+    def device_login(self) -> dict:
+        """Interactive device-code sign-in. Returns the token response."""
+        status, start = _post_form(
+            f"{self.authority}/oauth2/v2.0/devicecode",
+            {"client_id": self.client_id, "scope": self.scopes},
+        )
+        if "device_code" not in start:
+            raise ImapAuthError(
+                f"Could not start the sign-in: {_describe_token_error(start)}. Check "
+                "IMAP_OAUTH_CLIENT_ID and that 'Allow public client flows' is enabled for the app."
+            )
+        url = start.get("verification_uri") or start.get("verification_url") or "https://microsoft.com/devicelogin"
+        lifetime = int(start.get("expires_in", 900))
+        print("\n=== Sign in ===")
+        print(f"On any device with a browser, open:  {url}")
+        print(f"and enter the code:                  {start['user_code']}")
+        print("Sign in with the Outlook.com account and approve the request.")
+        print(f"Waiting up to {lifetime // 60} minutes for you to finish (Ctrl-C to cancel)...",
+              flush=True)
+        interval = int(start.get("interval", 5))
+        deadline = time.monotonic() + lifetime
+        while time.monotonic() < deadline:
+            interruptible_wait(interval)
+            _status, result = _post_form(
+                f"{self.authority}/oauth2/v2.0/token",
+                {
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                    "client_id": self.client_id,
+                    "device_code": start["device_code"],
+                },
+            )
+            if "access_token" in result:
+                return result
+            error = result.get("error")
+            if error == "authorization_pending":
+                continue
+            if error == "slow_down":
+                interval += 5
+                continue
+            raise ImapAuthError(f"Sign-in failed: {_describe_token_error(result)}")
+        raise ImapAuthError("The sign-in code expired before it was used. Run --authorise again.")
+
+
+def xoauth2_authenticate(conn: imaplib.IMAP4, username: str, access_token: str) -> None:
+    """SASL XOAUTH2. Raises imaplib.IMAP4.error (with server detail) if rejected."""
+    challenges: list[str] = []
+    sent = [False]
+
+    def authobject(challenge):
+        if not sent[0]:
+            sent[0] = True
+            return f"user={username}\x01auth=Bearer {access_token}\x01\x01"
+        # The server sent an error challenge: record it and end the exchange.
+        challenges.append(challenge.decode("utf-8", "replace") if challenge else "")
+        return ""
+
+    try:
+        conn.authenticate("XOAUTH2", authobject)
+    except imaplib.IMAP4.error as exc:
+        detail = " ".join(a.decode("utf-8", "replace") if isinstance(a, bytes) else str(a)
+                          for a in exc.args)
+        if challenges and challenges[0]:
+            detail += f" (server detail: {challenges[0][:200]})"
+        raise imaplib.IMAP4.error(detail) from exc
+
+
+def run_authorise(config: dict) -> int:
+    """One-time interactive sign-in; saves the token only if IMAP login then works."""
+    if config["auth"] != "microsoft-oauth2":
+        raise ValueError("--authorise is only for Outlook.com accounts: set IMAP_AUTH=microsoft-oauth2.")
+    oauth: MicrosoftOAuth = config["oauth"]
+    result = oauth.device_login()
+    refresh_token = result.get("refresh_token")
+    if not refresh_token:
+        raise ImapAuthError(
+            "Sign-in worked but Microsoft returned no refresh token. Make sure "
+            "'offline_access' is added as a delegated permission on the app."
+        )
+    print("Signed in. Checking that this account can use IMAP...", flush=True)
+
+    context = ssl.create_default_context(cafile=config.get("ca_file"))
+    conn = imaplib.IMAP4_SSL(host=config["host"], port=config["port"],
+                             ssl_context=context, timeout=DEFAULT_HTTP_TIMEOUT_SECONDS)
+    try:
+        try:
+            xoauth2_authenticate(conn, config["username"], result["access_token"])
+        except imaplib.IMAP4.error as exc:
+            raise ImapAuthError(
+                f"The server rejected the new sign-in ({exc}). Check that you signed in as "
+                f"{config['username']!r}, that IMAP is enabled for the mailbox, and that the "
+                "app has the IMAP.AccessAsUser.All permission. Nothing was saved."
+            ) from exc
+        typ, folders = conn.list()
+        count = len([f for f in folders or [] if f]) if typ == "OK" else 0
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+
+    oauth.save_refresh_token(refresh_token)
+    print(f"Success: {config['username']} can use IMAP ({count} folders). "
+          f"Sign-in saved to {oauth.token_file} (owner-only).")
+    print("You can now run the importer without --authorise. Keep that file private.")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # IMAP session with reconnect, backoff and optional adaptive pacing
 # --------------------------------------------------------------------------
 
@@ -326,6 +647,9 @@ class ImapSession:
     # -- connection ------------------------------------------------------
     def _open(self) -> None:
         cfg = self.config
+        oauth: Optional[MicrosoftOAuth] = cfg.get("oauth")
+        # Get the token first: a token problem must not leave a connection open.
+        access_token = oauth.access_token() if oauth else None
         context = ssl.create_default_context(cafile=cfg.get("ca_file"))
         timeout = DEFAULT_HTTP_TIMEOUT_SECONDS
         conn: Optional[imaplib.IMAP4] = None
@@ -343,20 +667,37 @@ class ImapSession:
                         "Refusing to send credentials unencrypted."
                     )
                 conn.starttls(ssl_context=context)
-            try:
-                conn.login(cfg["username"], cfg["password"])
-            except imaplib.IMAP4.error as exc:
-                text = " ".join(
-                    a.decode("utf-8", "replace") if isinstance(a, bytes) else str(a)
-                    for a in exc.args
-                )
-                if any(marker in text.upper() for marker in TRANSIENT_RESPONSE_MARKERS):
-                    raise _TransientResponse(text) from exc
-                raise ImapAuthError(
-                    f"The server rejected the login for {cfg['username']!r}: {text}. "
-                    "Check the username and password. Many providers require an "
-                    "app-specific password or IMAP to be enabled for the account."
-                ) from exc
+            if oauth is not None:
+                try:
+                    xoauth2_authenticate(conn, cfg["username"], access_token)
+                except imaplib.IMAP4.error as exc:
+                    text = str(exc)
+                    if any(marker in text.upper() for marker in TRANSIENT_RESPONSE_MARKERS):
+                        raise _TransientResponse(text) from exc
+                    if not oauth.token_is_fresh:
+                        oauth.invalidate()
+                        raise _TokenRejected(text) from exc
+                    raise ImapAuthError(
+                        f"The server rejected a freshly issued OAuth token for "
+                        f"{cfg['username']!r}: {text}. Check that IMAP is enabled for the "
+                        "mailbox and that this is the account you signed in with; if in "
+                        "doubt run --authorise again."
+                    ) from exc
+            else:
+                try:
+                    conn.login(cfg["username"], cfg["password"])
+                except imaplib.IMAP4.error as exc:
+                    text = " ".join(
+                        a.decode("utf-8", "replace") if isinstance(a, bytes) else str(a)
+                        for a in exc.args
+                    )
+                    if any(marker in text.upper() for marker in TRANSIENT_RESPONSE_MARKERS):
+                        raise _TransientResponse(text) from exc
+                    raise ImapAuthError(
+                        f"The server rejected the login for {cfg['username']!r}: {text}. "
+                        "Check the username and password. Many providers require an "
+                        "app-specific password or IMAP to be enabled for the account."
+                    ) from exc
         except BaseException:
             if conn is not None:
                 self._close_quietly(conn)
@@ -429,6 +770,8 @@ class ImapSession:
                     "If the server uses a private certificate authority, set "
                     "IMAP_CA_FILE to its PEM file."
                 ) from exc
+            except _TokenRejected as exc:
+                reason = f"cached OAuth token was rejected ({exc}); fetching a new one"
             except _TransientResponse as exc:
                 self._note_throttle()
                 reason = f"server asked to slow down ({exc})"
@@ -529,8 +872,28 @@ def read_password() -> str:
     return password
 
 
+def _boolean_choice(name: str, default: str) -> str:
+    value = os.environ.get(name, default).strip().casefold() or default
+    mapping = {"true": "true", "yes": "true", "1": "true", "on": "true",
+               "false": "false", "no": "false", "0": "false", "off": "false", "auto": "auto"}
+    if value not in mapping:
+        raise ValueError(f"{name} must be auto, true or false.")
+    return mapping[value]
+
+
 def get_configuration() -> dict:
-    host = required_environment("IMAP_HOST")
+    auth = os.environ.get("IMAP_AUTH", "password").strip().casefold() or "password"
+    if auth == "oauth2":
+        raise ValueError(
+            "IMAP_AUTH=oauth2 has been renamed to IMAP_AUTH=microsoft-oauth2, because the "
+            "OAuth support is specific to Microsoft (Outlook.com) accounts."
+        )
+    if auth not in ("password", "microsoft-oauth2"):
+        raise ValueError("IMAP_AUTH must be 'password' (default) or 'microsoft-oauth2'.")
+    if auth == "microsoft-oauth2":
+        host = os.environ.get("IMAP_HOST", "").strip() or DEFAULT_OAUTH_HOST
+    else:
+        host = required_environment("IMAP_HOST")
     username = required_environment("IMAP_USERNAME")
     security = os.environ.get("IMAP_SECURITY", "ssl").strip().casefold()
     if security not in ("ssl", "starttls"):
@@ -554,16 +917,33 @@ def get_configuration() -> dict:
     if ca_file and not Path(ca_file).expanduser().is_file():
         raise ValueError(f"IMAP_CA_FILE not found: {ca_file}")
 
+    password = None
+    oauth = None
+    if auth == "password":
+        password = read_password()
+    else:
+        client_id = required_environment("IMAP_OAUTH_CLIENT_ID")
+        tenant = os.environ.get("IMAP_OAUTH_TENANT", "consumers").strip() or "consumers"
+        scopes = os.environ.get("IMAP_OAUTH_SCOPES", "").strip() or DEFAULT_OAUTH_SCOPES
+        token_text = os.environ.get("IMAP_OAUTH_TOKEN_FILE", "").strip()
+        token_file = (Path(token_text).expanduser() if token_text else
+                      Path("~/.config/imap-local-repository").expanduser()
+                      / (safe_repository_name(username) + ".oauth.json"))
+        oauth = MicrosoftOAuth(client_id, tenant, scopes, token_file)
+
     db_location = Path(os.environ.get("DB_LOCATION", DEFAULT_DB_LOCATION)).expanduser()
     repo_name = os.environ.get("IMAP_REPOSITORY_NAME", "").strip() or username
     repository_path = db_location / safe_repository_name(repo_name)
 
     return {
+        "auth": auth,
         "host": host,
         "port": port,
         "security": security,
         "username": username,
-        "password": read_password(),
+        "password": password,
+        "oauth": oauth,
+        "ipv4_only": _boolean_choice("IMAP_IPV4_ONLY", "auto"),
         "ca_file": str(Path(ca_file).expanduser()) if ca_file else None,
         "request_interval": request_interval,
         "include_folders": _split_names(os.environ.get("IMAP_FOLDERS", "")),
@@ -1273,7 +1653,7 @@ def verify_repository_files(connection: sqlite3.Connection, repository_path: Pat
 
 def build_argument_parser() -> argparse.ArgumentParser:
     prog = Path(sys.argv[0]).name
-    return argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         prog=prog,
         description=(
             "Import messages from any IMAP4 server into an authoritative local "
@@ -1281,13 +1661,26 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""\
-REQUIRED SETTINGS
+A. REGULAR IMAP (username + password; any IMAP4 server) -- the default
   IMAP_HOST                 IMAP server host name
   IMAP_USERNAME             Login name (often the full e-mail address)
   IMAP_PASSWORD_FILE        File containing the password (preferred; chmod 600)
   IMAP_PASSWORD             Password in the environment (alternative)
 
-OPTIONAL SETTINGS
+B. OUTLOOK.COM OAUTH (Microsoft personal accounts ONLY; IMAP_AUTH=microsoft-oauth2)
+  Not for Gmail, Yahoo or other providers. Use A for those.
+  IMAP_USERNAME             The Outlook.com address
+  IMAP_OAUTH_CLIENT_ID      Application (client) ID of your Microsoft Entra app
+  IMAP_HOST                 Default outlook.office365.com
+  IMAP_OAUTH_TOKEN_FILE     Saved sign-in (default ~/.config/imap-local-repository/
+                            <username>.oauth.json, owner-only)
+  IMAP_OAUTH_TENANT         Default consumers (personal Microsoft accounts)
+  IMAP_OAUTH_SCOPES         Default https://outlook.office.com/IMAP.AccessAsUser.All offline_access
+  Run once with --authorise: it shows a code and URL; open the URL on any
+  device with a browser, enter the code and sign in. No browser is needed on
+  the machine running this script.
+
+OPTIONAL SETTINGS (both)
   IMAP_SECURITY             ssl (default; implicit TLS, port 993) or starttls (port 143).
                             Unencrypted IMAP is not supported.
   IMAP_PORT                 Override the default port
@@ -1299,6 +1692,8 @@ OPTIONAL SETTINGS
   IMAP_REPOSITORY_NAME      Repository directory name (default: the username)
   IMAP_REQUEST_INTERVAL     Minimum seconds between commands (default 0; raised
                             automatically if the server throttles)
+  IMAP_IPV4_ONLY            auto (default: use IPv4 only if IPv6 does not work),
+                            true or false
   IMAP_MIN_FREE_BYTES       Free-space reserve (default {DEFAULT_MIN_FREE_BYTES}; 0 disables)
   DB_LOCATION               Parent directory for repositories (default {DEFAULT_DB_LOCATION})
 
@@ -1327,15 +1722,23 @@ EXIT CODES
   3 server kept failing after retries     4 disk full   130 Ctrl-C
 """,
     )
+    parser.add_argument(
+        "--authorise", "--authorize", dest="authorise", action="store_true",
+        help="Outlook.com only: sign in once (device-code flow) and save the token",
+    )
+    return parser
 
 
 def main() -> int:
-    build_argument_parser().parse_args()  # --help works without any environment
+    args = build_argument_parser().parse_args()  # --help works without any environment
 
     connection = None
     session = None
     try:
         config = get_configuration()
+        apply_network_preference(config)
+        if args.authorise:
+            return run_authorise(config)
         repository_path = config["repository_path"]
         mode = detect_repository_mode(repository_path)
 
@@ -1381,6 +1784,9 @@ def main() -> int:
     except DiskSpaceExhausted as exc:
         logging.error("DISK SPACE: %s", exc)
         return 4
+    except ImapAuthError as exc:
+        logging.error("%s", exc)
+        return 2
     except (ValueError, RuntimeError, OSError, sqlite3.Error, imaplib.IMAP4.error) as exc:
         if is_disk_full_error(exc):
             logging.error(
